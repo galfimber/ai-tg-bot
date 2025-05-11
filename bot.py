@@ -10,9 +10,8 @@ from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, Update
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
-from aiohttp import web
+from aiohttp import web, ClientSession
 from dotenv import load_dotenv
-import requests
 
 # Настройка логов
 logging.basicConfig(
@@ -36,34 +35,26 @@ dp = Dispatcher()
 # Хранение данных
 user_context: Dict[int, List[dict]] = {}
 user_edit_state: Dict[int, dict] = {}
+http_session: Optional[ClientSession] = None
 
 # --- Вспомогательные функции ---
 async def make_api_request(url: str, method: str = "POST", **kwargs) -> Tuple[bool, dict]:
-    """Универсальная функция для API-запросов с обработкой ошибок"""
+    """Универсальная функция для асинхронных API-запросов"""
+    global http_session
     try:
-        response = await requests.request(
-            method,
-            url,
-            **kwargs,
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            error_msg = f"API error: {response.status_code} - {response.text}"
-            logger.error(error_msg)
-            return False, {"error": error_msg}
-        
-        try:
-            return True, response.json()
-        except ValueError as e:
-            error_msg = f"JSON decode error: {str(e)}"
-            logger.error(error_msg)
-            return False, {"error": error_msg}
-            
-    except requests.exceptions.RequestException as e:
-        error_msg = f"Request failed: {str(e)}"
-        logger.error(error_msg)
-        return False, {"error": error_msg}
+        async with http_session.request(method, url, **kwargs) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                logger.error(f"API error {response.status}: {error_text}")
+                return False, {"error": f"API error {response.status}"}
+
+            try:
+                return True, await response.json()
+            except json.JSONDecodeError:
+                return False, {"error": "Invalid JSON response"}
+    except Exception as e:
+        logger.error(f"Request failed: {str(e)}", exc_info=True)
+        return False, {"error": str(e)}
 
 def validate_message(message: Optional[types.Message]) -> bool:
     """Проверка валидности сообщения"""
@@ -139,104 +130,25 @@ async def generate_image(message: Message):
     try:
         await message.answer_chat_action("upload_photo")
         
+        form_data = aiohttp.FormData()
+        form_data.add_field('prompt', prompt)
+        form_data.add_field('output_format', 'png')
+        
         success, result = await make_api_request(
             "https://api.stability.ai/v2beta/stable-image/generate/sd3",
             method="POST",
             headers={"Authorization": f"Bearer {STABILITY_API_KEY}"},
-            files={"none": ""},
-            data={"prompt": prompt, "output_format": "png"}
+            data=form_data
         )
         
         if success:
-            await message.answer_photo(result.content, caption=f"🎨 {prompt}")
+            await message.answer_photo(result['image'], caption=f"🎨 {prompt}")
         else:
             await message.answer(f"❌ Ошибка генерации: {result.get('error', 'Unknown error')}")
             
     except Exception as e:
         logger.error(f"Generation error: {str(e)}", exc_info=True)
         await message.answer(f"⚠️ Ошибка: {str(e)}")
-
-# --- Загрузка изображений ---
-@dp.message(F.content_type.in_({ContentType.PHOTO, ContentType.DOCUMENT}))
-async def handle_image_upload(message: Message):
-    if not validate_message(message):
-        return
-    
-    user_id = message.from_user.id
-    
-    if user_id not in user_edit_state:
-        return
-    
-    try:
-        if message.document:
-            if not message.document.mime_type.startswith("image/"):
-                await message.answer("Отправьте только JPEG/PNG!")
-                return
-            
-            file = await bot.get_file(message.document.file_id)
-            ext = guess_extension(message.document.mime_type) or ".jpg"
-        else:
-            file = await bot.get_file(message.photo[-1].file_id)
-            ext = ".jpg"
-        
-        downloaded = await bot.download_file(file.file_path)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(downloaded.read())
-            user_edit_state[user_id]["image_path"] = tmp.name
-        
-        await message.answer("Теперь опишите изменения (например: 'Убери фон'):")
-        
-    except Exception as e:
-        logger.error(f"Upload error: {str(e)}", exc_info=True)
-        await message.answer(f"⚠️ Ошибка загрузки: {str(e)}")
-        user_edit_state.pop(user_id, None)
-
-# --- Редактирование изображений ---
-@dp.message(F.text, F.from_user.id.in_(user_edit_state.keys()))
-async def process_image_edit(message: Message):
-    if not validate_message(message):
-        return
-    
-    user_id = message.from_user.id
-    edit_prompt = message.text
-    image_path = user_edit_state[user_id].get("image_path")
-    
-    if not image_path or not os.path.exists(image_path):
-        await message.answer("❌ Изображение не найдено. Начните заново.")
-        user_edit_state.pop(user_id, None)
-        return
-    
-    try:
-        await message.answer_chat_action("upload_photo")
-        
-        with open(image_path, "rb") as img_file:
-            response = requests.post(
-                "https://api.stability.ai/v2beta/stable-image/edit/inpaint",
-                headers={"Authorization": f"Bearer {STABILITY_API_KEY}"},
-                files={"image": img_file},
-                data={
-                    "prompt": edit_prompt,
-                    "output_format": "png",
-                },
-                timeout=90
-            )
-        
-        if response.status_code == 200:
-            await message.answer_photo(
-                response.content,
-                caption=f"✏️ Редактирование: {edit_prompt}"
-            )
-        else:
-            error = response.json().get("message", "Unknown error")
-            await message.answer(f"❌ Ошибка редактирования: {error}")
-            
-    except Exception as e:
-        logger.error(f"Edit error: {str(e)}", exc_info=True)
-        await message.answer(f"⚠️ Ошибка API: {str(e)}")
-    finally:
-        if image_path and os.path.exists(image_path):
-            os.unlink(image_path)
-        user_edit_state.pop(user_id, None)
 
 # --- Текстовый чат ---
 @dp.message(F.text)
@@ -312,6 +224,9 @@ async def webhook_handler(request: web.Request):
 
 # --- Запуск приложения ---
 async def on_startup(app: web.Application):
+    global http_session
+    http_session = ClientSession()
+    
     try:
         await bot.set_webhook(
             url=f"{BASE_URL}/webhook",
@@ -323,10 +238,17 @@ async def on_startup(app: web.Application):
         logger.error(f"Webhook error: {str(e)}")
         raise
 
+async def on_shutdown(app: web.Application):
+    global http_session
+    if http_session:
+        await http_session.close()
+    await bot.delete_webhook()
+
 if __name__ == "__main__":
     app = web.Application()
     app.router.add_post("/webhook", webhook_handler)
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     
     try:
         web.run_app(
