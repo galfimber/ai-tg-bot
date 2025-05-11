@@ -18,7 +18,8 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+BASE_URL = os.getenv("BASE_URL")
 
 # Инициализация бота
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
@@ -50,12 +51,12 @@ async def cmd_start(message: Message):
     )
 
 # --- Установка вебхука ---
-async def on_startup(bot: Bot, base_url: str):
+async def on_startup(bot: Bot):
     await bot.set_webhook(
-        url=f"{base_url}/webhook",
+        url=f"{BASE_URL}/webhook",
         drop_pending_updates=True
     )
-    print(f"Webhook установлен на {base_url}/webhook")
+    print(f"Webhook установлен на {BASE_URL}/webhook")
 
 # --- Текстовые сообщения ---
 @dp.message(F.text == "🔄 Сбросить контекст")
@@ -209,12 +210,8 @@ async def handle_ai_chat(message: Message):
 
 # --- Запуск приложения ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="https://ai-tg-bot-zrlt.onrender.com")
-    args = parser.parse_args()
-
-    # Регистрация startup-функции
-    dp.startup.register(on_startup, args.base_url)
+    # Регистрация startup-функции (без передачи base_url)
+    dp.startup.register(on_startup)
 
     # Настройка aiohttp-сервера
     app = web.Application()
