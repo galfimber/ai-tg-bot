@@ -12,9 +12,9 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    Update
+    Update,
+    DefaultBotProperties
 )
-from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiohttp import web, ClientSession, FormData
 from dotenv import load_dotenv
@@ -34,7 +34,11 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 BASE_URL = os.getenv("BASE_URL")
 PORT = int(os.getenv("PORT", 10000))
 
-# Инициализация бота с новым синтаксисом
+# Проверка обязательных переменных
+if not TOKEN or not STABILITY_API_KEY:
+    raise ValueError("Не заданы обязательные переменные окружения")
+
+# Инициализация бота
 bot = Bot(
     token=TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -46,21 +50,29 @@ user_context: Dict[int, List[dict]] = {}
 user_edit_state: Dict[int, dict] = {}
 http_session: Optional[ClientSession] = None
 
-# --- Вспомогательные функции ---
 async def make_api_request(url: str, method: str = "POST", **kwargs) -> Tuple[bool, dict]:
     """Универсальная функция для асинхронных API-запросов"""
     global http_session
     try:
         async with http_session.request(method, url, **kwargs) as response:
+            response_text = await response.text()
+            
             if response.status != 200:
-                error_text = await response.text()
-                logger.error(f"API error {response.status}: {error_text}")
-                return False, {"error": f"API error {response.status}"}
-
+                logger.error(f"API error {response.status}: {response_text}")
+                return False, {
+                    "error": f"API error {response.status}",
+                    "details": response_text[:500]  # Логируем первые 500 символов
+                }
+            
             try:
-                return True, await response.json()
+                if response_text:  # Проверка на пустой ответ
+                    return True, await response.json()
+                return False, {"error": "Empty API response"}
             except json.JSONDecodeError:
-                return False, {"error": "Invalid JSON response"}
+                return False, {
+                    "error": "Invalid JSON response",
+                    "response": response_text[:500]
+                }
     except Exception as e:
         logger.error(f"Request failed: {str(e)}", exc_info=True)
         return False, {"error": str(e)}
@@ -75,7 +87,6 @@ def validate_message(message: Optional[types.Message]) -> bool:
         return False
     return True
 
-# --- Клавиатуры ---
 def get_main_kb() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.row(
@@ -85,7 +96,6 @@ def get_main_kb() -> ReplyKeyboardMarkup:
     builder.row(KeyboardButton(text="🔄 Сбросить контекст"))
     return builder.as_markup(resize_keyboard=True)
 
-# --- Команды ---
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     if not validate_message(message):
@@ -99,7 +109,6 @@ async def cmd_start(message: Message):
         reply_markup=get_main_kb()
     )
 
-# --- Текстовые сообщения ---
 @dp.message(F.text == "🔄 Сбросить контекст")
 async def reset_context(message: Message):
     if not validate_message(message):
@@ -123,7 +132,6 @@ async def ask_edit_photo(message: Message):
     user_edit_state[message.from_user.id] = {}
     await message.answer("Загрузите изображение:")
 
-# --- Генерация изображений ---
 @dp.message(
     F.text,
     F.reply_to_message.func(
@@ -143,29 +151,43 @@ async def generate_image(message: Message):
         form_data.add_field('prompt', prompt)
         form_data.add_field('output_format', 'png')
         
+        headers = {
+            "Authorization": f"Bearer {STABILITY_API_KEY}",
+            "Accept": "image/*"  # Явно указываем ожидаемый тип ответа
+        }
+        
         success, result = await make_api_request(
             "https://api.stability.ai/v2beta/stable-image/generate/sd3",
             method="POST",
-            headers={"Authorization": f"Bearer {STABILITY_API_KEY}"},
+            headers=headers,
             data=form_data
         )
         
         if success:
-            await message.answer_photo(result['image'], caption=f"🎨 {prompt}")
+            # Для бинарных ответов (изображений) используем response.read()
+            async with http_session.post(
+                "https://api.stability.ai/v2beta/stable-image/generate/sd3",
+                headers=headers,
+                data=form_data
+            ) as response:
+                if response.status == 200:
+                    image_data = await response.read()
+                    await message.answer_photo(image_data, caption=f"🎨 {prompt}")
+                else:
+                    error_text = await response.text()
+                    await message.answer(f"❌ Ошибка генерации: {response.status}\n{error_text[:300]}")
         else:
-            await message.answer(f"❌ Ошибка генерации: {result.get('error', 'Unknown error')}")
+            await message.answer(f"❌ Ошибка API: {result.get('error', 'Unknown error')}")
             
     except Exception as e:
         logger.error(f"Generation error: {str(e)}", exc_info=True)
         await message.answer(f"⚠️ Ошибка: {str(e)}")
 
-# --- Текстовый чат ---
 @dp.message(F.text)
 async def handle_ai_chat(message: Message):
     if not validate_message(message):
         return
     
-    # Пропускаем служебные команды
     if message.text in ["🖼 Сгенерировать изображение", 
                        "✏️ Редактировать изображение",
                        "🔄 Сбросить контекст"]:
@@ -182,7 +204,10 @@ async def handle_ai_chat(message: Message):
         success, response = await make_api_request(
             "https://api.deepseek.com/v1/chat/completions",
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}" if DEEPSEEK_API_KEY else ""
+            },
             json={
                 "model": "deepseek-chat",
                 "messages": user_context[user_id],
@@ -201,7 +226,6 @@ async def handle_ai_chat(message: Message):
         logger.error(f"Chat error: {str(e)}", exc_info=True)
         await message.answer(f"⚠️ Ошибка: {str(e)}")
 
-# --- Обработчик вебхука ---
 async def webhook_handler(request: web.Request):
     try:
         if request.method != 'POST':
@@ -231,7 +255,6 @@ async def webhook_handler(request: web.Request):
     except Exception:
         return web.Response(status=500)
 
-# --- Запуск приложения ---
 async def on_startup(app: web.Application):
     global http_session
     http_session = ClientSession()
