@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import tempfile
 from typing import Dict, List
 from mimetypes import guess_extension
 
@@ -11,17 +12,21 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiohttp import web
 from dotenv import load_dotenv
+import requests
 
 # Настройка логов
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Загрузка конфигурации
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "https://ai-tg-bot-zrlt.onrender.com")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+BASE_URL = os.getenv("BASE_URL")
 PORT = int(os.getenv("PORT", 10000))
 
 # Инициализация бота
@@ -119,7 +124,7 @@ async def handle_image_upload(message: Message):
             tmp.write(downloaded.read())
             user_edit_state[user_id]["image_path"] = tmp.name
         
-        await message.answer("Теперь опишите изменения (например: 'Убери фон' или 'Добавь мяч в глу'):")
+        await message.answer("Теперь опишите изменения (например: 'Убери фон'):")
         
     except Exception as e:
         logger.error(f"Upload error: {str(e)}")
@@ -207,41 +212,84 @@ async def handle_ai_chat(message: Message):
 # --- Обработчик вебхука ---
 async def webhook_handler(request: web.Request):
     try:
-        data = await request.text()
-        if not data:
-            logger.error("Empty request body")
-            return web.Response(status=400, text="Empty body")
+        # Логируем входящий запрос
+        logger.info(f"Incoming request from {request.remote}")
         
+        # Проверяем Content-Type
+        if request.content_type != 'application/json':
+            logger.error(f"Invalid content type: {request.content_type}")
+            return web.Response(status=415, text="Unsupported Media Type")
+
+        # Читаем тело запроса
         try:
-            update_data = json.loads(data)
+            data = await request.json()
+            logger.debug(f"Received update: {json.dumps(data, indent=2)}")
         except json.JSONDecodeError as e:
             logger.error(f"JSON decode error: {str(e)}")
             return web.Response(status=400, text="Invalid JSON")
-        
-        update = types.Update(**update_data)
-        await dp.feed_update(bot, update)
-        return web.Response()
-    
+        except Exception as e:
+            logger.error(f"Request read error: {str(e)}")
+            return web.Response(status=400, text="Bad Request")
+
+        # Валидация структуры Update
+        if not isinstance(data, dict) or 'update_id' not in data:
+            logger.error(f"Invalid update structure: {data}")
+            return web.Response(status=400, text="Invalid update format")
+
+        # Создаем объект Update
+        try:
+            update = types.Update(**data)
+            logger.info(f"Processing update ID: {update.update_id}")
+        except Exception as e:
+            logger.error(f"Update creation error: {str(e)}")
+            return web.Response(status=400, text="Invalid update data")
+
+        # Обрабатываем update
+        try:
+            await dp.feed_update(bot, update)
+            return web.Response(text="OK")
+        except Exception as e:
+            logger.error(f"Update processing error: {str(e)}", exc_info=True)
+            return web.Response(status=500, text="Internal Server Error")
+
     except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
-        return web.Response(status=500, text="Server error")
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        return web.Response(status=500, text="Server Error")
+
+# Middleware для логирования обработки апдейтов
+@dp.update.middleware()
+async def log_updates(handler, event: types.Update, data):
+    logger.info(f"Processing update ID: {event.update_id}")
+    try:
+        return await handler(event, data)
+    except Exception as e:
+        logger.error(f"Handler error: {str(e)}", exc_info=True)
+        raise
 
 # --- Запуск приложения ---
 async def on_startup(app: web.Application):
-    await bot.set_webhook(
-        url=f"{BASE_URL}/webhook",
-        drop_pending_updates=True
-    )
-    logger.info("Webhook установлен")
+    try:
+        await bot.set_webhook(
+            url=f"{BASE_URL}/webhook",
+            drop_pending_updates=True
+        )
+        logger.info(f"Webhook установлен на {BASE_URL}/webhook")
+    except Exception as e:
+        logger.error(f"Webhook setup error: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     app = web.Application()
     app.router.add_post("/webhook", webhook_handler)
     app.on_startup.append(on_startup)
     
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        access_log=logger
-    )
+    try:
+        web.run_app(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            access_log=logger
+        )
+    except Exception as e:
+        logger.error(f"Server error: {str(e)}")
+        raise
