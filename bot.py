@@ -1,6 +1,6 @@
 import os
-import tempfile
-import argparse
+import json
+import logging
 from typing import Dict, List
 from mimetypes import guess_extension
 
@@ -9,17 +9,20 @@ from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-import requests
 from aiohttp import web
 from dotenv import load_dotenv
+
+# Настройка логов
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Загрузка конфигурации
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-BASE_URL = os.getenv("BASE_URL")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+BASE_URL = os.getenv("BASE_URL", "https://ai-tg-bot-zrlt.onrender.com")
+PORT = int(os.getenv("PORT", 10000))
 
 # Инициализация бота
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
@@ -49,14 +52,6 @@ async def cmd_start(message: Message):
         "- Редактирование изображения",
         reply_markup=get_main_kb()
     )
-
-# --- Установка вебхука ---
-async def on_startup(bot: Bot):
-    await bot.set_webhook(
-        url=f"{BASE_URL}/webhook",
-        drop_pending_updates=True
-    )
-    print(f"Webhook установлен на {BASE_URL}/webhook")
 
 # --- Текстовые сообщения ---
 @dp.message(F.text == "🔄 Сбросить контекст")
@@ -96,6 +91,7 @@ async def generate_image(message: Message):
             await message.answer(f"❌ Ошибка генерации: {error}")
             
     except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
         await message.answer(f"⚠️ Ошибка: {str(e)}")
 
 # --- Загрузка изображений ---
@@ -107,7 +103,6 @@ async def handle_image_upload(message: Message):
         return
     
     try:
-        # Для документов проверяем MIME-тип
         if message.document:
             if not message.document.mime_type.startswith("image/"):
                 await message.answer("Отправьте только JPEG/PNG!")
@@ -115,19 +110,19 @@ async def handle_image_upload(message: Message):
             
             file = await bot.get_file(message.document.file_id)
             ext = guess_extension(message.document.mime_type) or ".jpg"
-        else:  # Для фото
+        else:
             file = await bot.get_file(message.photo[-1].file_id)
             ext = ".jpg"
         
-        # Сохраняем во временный файл
         downloaded = await bot.download_file(file.file_path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             tmp.write(downloaded.read())
             user_edit_state[user_id]["image_path"] = tmp.name
         
-        await message.answer("Теперь опишите изменения (например: 'Добавь мяч в углу', 'Убери фон' или 'Сделай стиль киберпанк'):")
+        await message.answer("Теперь опишите изменения (например: 'Убери фон' или 'Добавь мяч в глу'):")
         
     except Exception as e:
+        logger.error(f"Upload error: {str(e)}")
         await message.answer(f"⚠️ Ошибка загрузки: {str(e)}")
         user_edit_state.pop(user_id, None)
 
@@ -168,9 +163,9 @@ async def process_image_edit(message: Message):
             await message.answer(f"❌ Ошибка редактирования: {error}")
             
     except Exception as e:
+        logger.error(f"Edit error: {str(e)}")
         await message.answer(f"⚠️ Ошибка API: {str(e)}")
     finally:
-        # Очистка
         if image_path and os.path.exists(image_path):
             os.unlink(image_path)
         user_edit_state.pop(user_id, None)
@@ -206,16 +201,47 @@ async def handle_ai_chat(message: Message):
         await message.answer(answer, reply_markup=get_main_kb())
         
     except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
         await message.answer(f"⚠️ Ошибка: {str(e)}")
 
+# --- Обработчик вебхука ---
+async def webhook_handler(request: web.Request):
+    try:
+        data = await request.text()
+        if not data:
+            logger.error("Empty request body")
+            return web.Response(status=400, text="Empty body")
+        
+        try:
+            update_data = json.loads(data)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {str(e)}")
+            return web.Response(status=400, text="Invalid JSON")
+        
+        update = types.Update(**update_data)
+        await dp.feed_update(bot, update)
+        return web.Response()
+    
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return web.Response(status=500, text="Server error")
+
 # --- Запуск приложения ---
+async def on_startup(app: web.Application):
+    await bot.set_webhook(
+        url=f"{BASE_URL}/webhook",
+        drop_pending_updates=True
+    )
+    logger.info("Webhook установлен")
+
 if __name__ == "__main__":
-    # Регистрация startup-функции (без передачи base_url)
-    dp.startup.register(on_startup)
-
-    # Настройка aiohttp-сервера
     app = web.Application()
-    SimpleRequestHandler(dp, bot=bot).register(app, path="/webhook")
-
-    # Запуск
-    web.run_app(app, host="0.0.0.0", port=10000)
+    app.router.add_post("/webhook", webhook_handler)
+    app.on_startup.append(on_startup)
+    
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        access_log=logger
+    )
