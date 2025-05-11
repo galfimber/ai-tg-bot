@@ -1,18 +1,12 @@
 import os
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    Update,
-    BufferedInputFile
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -32,7 +26,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("BASE_URL")
 PORT = int(os.getenv("PORT"))
-SITE_URL = os.getenv("SITE_URL", "https://ainv-assistant-bot.com")
+SITE_URL = os.getenv("SITE_URL", "https://your-telegram-bot.com")
 SITE_NAME = os.getenv("SITE_NAME", "AI Telegram Bot")
 
 # Проверка обязательных переменных
@@ -40,49 +34,14 @@ if not TOKEN or not OPENROUTER_API_KEY:
     raise ValueError("Не заданы обязательные переменные окружения")
 
 # Инициализация бота
-bot = Bot(
-    token=TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # Хранение данных
-user_context: Dict[int, List[dict]] = {}
+user_context: Dict[int, Dict] = {}  # {"awaiting_image_prompt": bool, "chat_history": list}
 http_session: Optional[ClientSession] = None
 
-async def make_api_request(url: str, method: str = "POST", **kwargs) -> Tuple[bool, dict]:
-    """Универсальная функция для API-запросов через OpenRouter"""
-    global http_session
-    try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": SITE_URL,
-            "X-Title": SITE_NAME,
-            **kwargs.pop('headers', {})
-        }
-        
-        async with http_session.request(method, url, headers=headers, **kwargs) as response:
-            response_text = await response.text()
-            
-            if response.status != 200:
-                logger.error(f"API error {response.status}: {response_text}")
-                return False, {
-                    "error": f"API error {response.status}",
-                    "details": response_text[:500]
-                }
-            
-            try:
-                return True, await response.json()
-            except json.JSONDecodeError:
-                return False, {
-                    "error": "Invalid JSON response",
-                    "response": response_text[:500]
-                }
-    except Exception as e:
-        logger.error(f"Request failed: {str(e)}", exc_info=True)
-        return False, {"error": str(e)}
-
+# ========== Клавиатура ==========
 def get_main_kb() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.row(
@@ -91,11 +50,93 @@ def get_main_kb() -> ReplyKeyboardMarkup:
     )
     return builder.as_markup(resize_keyboard=True)
 
+# ========== API Functions ==========
+async def generate_image(prompt: str) -> Optional[bytes]:
+    """Генерация изображения через Stable Diffusion XL"""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": SITE_URL,
+        "X-Title": SITE_NAME
+    }
+    
+    payload = {
+        "model": "stabilityai/stable-diffusion-xl-base-1.0",
+        "input": {
+            "prompt": prompt,
+            "negative_prompt": "размыто, низкое качество, артефакты",
+            "width": 1024,
+            "height": 1024,
+            "num_inference_steps": 30
+        }
+    }
+    
+    try:
+        async with http_session.post(
+            "https://openrouter.ai/api/v1/images/generations",
+            headers=headers,
+            json=payload
+        ) as response:
+            data = await response.json()
+            
+            if response.status == 200:
+                image_url = data["data"][0]["url"]
+                async with http_session.get(image_url) as img_response:
+                    return await img_response.read()
+            logger.error(f"Ошибка генерации: {data}")
+            return None
+    except Exception as e:
+        logger.error(f"Ошибка при генерации изображения: {str(e)}")
+        return None
+
+async def ask_gemini(prompt: str, user_id: int) -> str:
+    """Запрос к Gemini через OpenRouter"""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": SITE_URL,
+        "X-Title": SITE_NAME
+    }
+    
+    # Инициализация контекста чата
+    if user_id not in user_context:
+        user_context[user_id] = {"chat_history": []}
+    elif "chat_history" not in user_context[user_id]:
+        user_context[user_id]["chat_history"] = []
+    
+    # Добавляем новый запрос в историю
+    user_context[user_id]["chat_history"].append({"role": "user", "content": prompt})
+    
+    payload = {
+        "model": "google/gemini-2.0-flash-exp:free",
+        "messages": user_context[user_id]["chat_history"][-6:],  # Последние 6 сообщений
+        "temperature": 0.7
+    }
+    
+    try:
+        async with http_session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload
+        ) as response:
+            data = await response.json()
+            
+            if response.status == 200:
+                reply = data["choices"][0]["message"]["content"]
+                user_context[user_id]["chat_history"].append({"role": "assistant", "content": reply})
+                return reply
+            error_msg = data.get("error", {}).get("message", "Неизвестная ошибка API")
+            return f"❌ Ошибка: {error_msg}"
+    except Exception as e:
+        logger.error(f"Ошибка запроса к Gemini: {str(e)}")
+        return "⚠️ Произошла ошибка при обработке запроса"
+
+# ========== Message Handlers ==========
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     await message.answer(
         "✨ <b>AI Бот с функциями:</b>\n"
-        "- Генерация изображений (Stable Diffusion XL)\n"
+        "- Генерация изображений через Stable Diffusion\n"
         "- Умный чат на основе Gemini Flash\n\n"
         "Используйте кнопки ниже:",
         reply_markup=get_main_kb()
@@ -108,88 +149,53 @@ async def reset_context(message: Message):
 
 @dp.message(F.text == "🖼 Сгенерировать изображение")
 async def ask_gen_prompt(message: Message):
+    user_id = message.from_user.id
+    if user_id not in user_context:
+        user_context[user_id] = {}
+    user_context[user_id]["awaiting_image_prompt"] = True
     await message.answer("Введите описание изображения:")
 
-@dp.message(
-    F.text,
-    F.reply_to_message.func(
-        lambda msg: msg and msg.text == "Введите описание изображения:"
-    )
-)
-async def generate_image(message: Message):
-    prompt = message.text.strip()
-    
-    try:
-        await message.answer_chat_action("upload_photo")
-        
-        payload = {
-            "model": "stabilityai/stable-diffusion-xl-base-1.0",
-            "input": {
-                "prompt": prompt,
-                "negative_prompt": "размыто, низкое качество",
-                "width": 1024,
-                "height": 1024
-            }
-        }
-        
-        success, result = await make_api_request(
-            "https://openrouter.ai/api/v1/images/generations",
-            json=payload
-        )
-        
-        if success:
-            image_url = result["data"][0]["url"]
-            async with http_session.get(image_url) as response:
-                if response.status == 200:
-                    image_data = await response.read()
-                    await message.answer_photo(
-                        BufferedInputFile(image_data, "generated.png"),
-                        caption=f"🎨 {prompt}"
-                    )
-                else:
-                    await message.answer("❌ Ошибка загрузки изображения")
-        else:
-            await message.answer(f"❌ Ошибка генерации: {result.get('error', 'Unknown error')}")
-            
-    except Exception as e:
-        logger.error(f"Generation error: {str(e)}", exc_info=True)
-        await message.answer(f"⚠️ Ошибка: {str(e)}")
-
 @dp.message(F.text)
-async def handle_ai_chat(message: Message):
-    if message.text in ["🖼 Сгенерировать изображение", "🔄 Сбросить контекст"]:
+async def handle_text(message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    
+    # Проверка на команду отмены
+    if text.lower() == "отмена":
+        if user_id in user_context:
+            user_context.pop(user_id)
+        await message.answer("Операция отменена", reply_markup=get_main_kb())
         return
     
-    user_id = message.from_user.id
-    
-    if user_id not in user_context:
-        user_context[user_id] = []
-    
-    user_context[user_id].append({"role": "user", "content": message.text})
-    
-    try:
-        payload = {
-            "model": "google/gemini-2.0-flash-exp:free",
-            "messages": user_context[user_id][-6:],  # Последние 6 сообщений
-            "temperature": 0.7
-        }
+    # Обработка запроса на генерацию изображения
+    if user_id in user_context and user_context[user_id].get("awaiting_image_prompt"):
+        user_context[user_id].pop("awaiting_image_prompt")
         
-        success, response = await make_api_request(
-            "https://openrouter.ai/api/v1/chat/completions",
-            json=payload
-        )
-        
-        if success:
-            answer = response["choices"][0]["message"]["content"]
-            user_context[user_id].append({"role": "assistant", "content": answer})
-            await message.answer(answer, reply_markup=get_main_kb())
-        else:
-            await message.answer(f"⚠️ Ошибка API: {response.get('error', 'Unknown error')}")
+        if len(text) > 500:
+            await message.answer("❌ Слишком длинное описание. Максимум 500 символов.")
+            return
             
-    except Exception as e:
-        logger.error(f"Chat error: {str(e)}", exc_info=True)
-        await message.answer(f"⚠️ Ошибка: {str(e)}")
+        await process_image_generation(message, text)
+        return
+    
+    # Обычный текстовый запрос
+    if text not in ["🖼 Сгенерировать изображение", "🔄 Сбросить контекст"]:
+        reply = await ask_gemini(text, user_id)
+        await message.answer(reply, reply_markup=get_main_kb())
 
+async def process_image_generation(message: Message, prompt: str):
+    await message.answer_chat_action("upload_photo")
+    image_data = await generate_image(prompt)
+    
+    if image_data:
+        await message.answer_photo(
+            BufferedInputFile(image_data, "generated_image.png"),
+            caption=f"🎨 {prompt}"
+        )
+    else:
+        await message.answer("❌ Не удалось сгенерировать изображение. Попробуйте другой запрос.")
+
+# ========== Webhook Setup ==========
 async def on_startup(app: web.Application):
     global http_session
     http_session = ClientSession()
