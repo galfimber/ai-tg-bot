@@ -1,5 +1,6 @@
 import os
 import tempfile
+import argparse
 from typing import Dict, List
 from mimetypes import guess_extension
 
@@ -8,7 +9,9 @@ from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 import requests
+from aiohttp import web
 from dotenv import load_dotenv
 
 # Загрузка конфигурации
@@ -17,12 +20,13 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
+# Инициализация бота
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# Хранение состояния пользователей
+# Хранение данных
 user_context: Dict[int, List[dict]] = {}
-user_edit_state: Dict[int, dict] = {}  # {user_id: {"image_path": str, "mask_path": str?}}
+user_edit_state: Dict[int, dict] = {}
 
 # --- Клавиатуры ---
 def get_main_kb() -> ReplyKeyboardMarkup:
@@ -45,7 +49,15 @@ async def cmd_start(message: Message):
         reply_markup=get_main_kb()
     )
 
-# --- Обработка текста ---
+# --- Установка вебхука ---
+async def on_startup(bot: Bot, base_url: str):
+    await bot.set_webhook(
+        url=f"{base_url}/webhook",
+        drop_pending_updates=True
+    )
+    print(f"Webhook установлен на {base_url}/webhook")
+
+# --- Текстовые сообщения ---
 @dp.message(F.text == "🔄 Сбросить контекст")
 async def reset_context(message: Message):
     user_context.pop(message.from_user.id, None)
@@ -57,6 +69,7 @@ async def ask_gen_prompt(message: Message):
 
 @dp.message(F.text == "✏️ Редактировать изображение")
 async def ask_edit_photo(message: Message):
+    user_edit_state[message.from_user.id] = {}
     await message.answer("Загрузите изображение:")
 
 # --- Генерация изображений ---
@@ -84,12 +97,11 @@ async def generate_image(message: Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {str(e)}")
 
-# --- Загрузка изображений для редактирования ---
+# --- Загрузка изображений ---
 @dp.message(F.content_type.in_({ContentType.PHOTO, ContentType.DOCUMENT}))
 async def handle_image_upload(message: Message):
     user_id = message.from_user.id
     
-    # Проверяем, ожидаем ли мы изображение для редактирования
     if user_id not in user_edit_state:
         return
     
@@ -112,13 +124,13 @@ async def handle_image_upload(message: Message):
             tmp.write(downloaded.read())
             user_edit_state[user_id]["image_path"] = tmp.name
         
-        await message.answer("Теперь опишите изменения (например: 'Добавь мяч в углу', 'Убери фон' или 'Сделай стиль киберпанк')")
+        await message.answer("Теперь опишите изменения (например: 'Добавь мяч в углу', 'Убери фон' или 'Сделай стиль киберпанк'):")
         
     except Exception as e:
         await message.answer(f"⚠️ Ошибка загрузки: {str(e)}")
         user_edit_state.pop(user_id, None)
 
-# --- Редактирование через Stability AI ---
+# --- Редактирование изображений ---
 @dp.message(F.text & F.from_user.id.in_(user_edit_state.keys()))
 async def process_image_edit(message: Message):
     user_id = message.from_user.id
@@ -162,7 +174,7 @@ async def process_image_edit(message: Message):
             os.unlink(image_path)
         user_edit_state.pop(user_id, None)
 
-# --- Текстовый чат с DeepSeek ---
+# --- Текстовый чат ---
 @dp.message(F.text & ~F.text.in_([
     "🖼 Сгенерировать изображение", 
     "✏️ Редактировать изображение",
@@ -195,6 +207,18 @@ async def handle_ai_chat(message: Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {str(e)}")
 
+# --- Запуск приложения ---
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(dp.start_polling(bot))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-url", default="https://ai-tg-bot-zrlt.onrender.com")
+    args = parser.parse_args()
+
+    # Регистрация startup-функции
+    dp.startup.register(on_startup, args.base_url)
+
+    # Настройка aiohttp-сервера
+    app = web.Application()
+    SimpleRequestHandler(dp, bot=bot).register(app, path="/webhook")
+
+    # Запуск
+    web.run_app(app, host="0.0.0.0", port=10000)

@@ -2,3 +2,4 @@ aiogram==3.3
 python-dotenv
 requests
 python-magic
+aiohttp
