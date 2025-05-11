@@ -6,11 +6,17 @@ from typing import Dict, List, Optional, Tuple
 from mimetypes import guess_extension
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.enums import ParseMode, ContentType
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, Update
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    Update,
+    DefaultBotProperties
+)
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, FormData
 from dotenv import load_dotenv
 
 # Настройка логов
@@ -28,8 +34,11 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 BASE_URL = os.getenv("BASE_URL")
 PORT = int(os.getenv("PORT", 10000))
 
-# Инициализация бота
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+# Инициализация бота с новым синтаксисом
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
 # Хранение данных
@@ -130,7 +139,7 @@ async def generate_image(message: Message):
     try:
         await message.answer_chat_action("upload_photo")
         
-        form_data = aiohttp.FormData()
+        form_data = FormData()
         form_data.add_field('prompt', prompt)
         form_data.add_field('output_format', 'png')
         
