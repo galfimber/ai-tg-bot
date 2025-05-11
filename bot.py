@@ -2,13 +2,20 @@ import os
 import json
 import logging
 import tempfile
-from typing import Dict, List
+from typing import Dict, List, Optional
 from mimetypes import guess_extension
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    Update,
+    User,
+    Chat
+)
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiohttp import web
 from dotenv import load_dotenv
@@ -37,6 +44,27 @@ dp = Dispatcher()
 user_context: Dict[int, List[dict]] = {}
 user_edit_state: Dict[int, dict] = {}
 
+# --- Валидация входящих сообщений ---
+def validate_message(message: Optional[types.Message]) -> bool:
+    if message is None:
+        logger.warning("Received None message")
+        return False
+    
+    if message.text is None and not any([
+        message.photo,
+        message.document,
+        message.sticker,
+        message.animation
+    ]):
+        logger.warning(f"Message without content: {message}")
+        return False
+    
+    if message.from_user is None:
+        logger.warning("Message without sender")
+        return False
+    
+    return True
+
 # --- Клавиатуры ---
 def get_main_kb() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
@@ -61,6 +89,9 @@ async def cmd_start(message: Message):
 # --- Текстовые сообщения ---
 @dp.message(F.text == "🔄 Сбросить контекст")
 async def reset_context(message: Message):
+    if not validate_message(message):
+        return
+    
     user_context.pop(message.from_user.id, None)
     await message.answer("Контекст очищен!", reply_markup=get_main_kb())
 
@@ -212,39 +243,37 @@ async def handle_ai_chat(message: Message):
 # --- Обработчик вебхука ---
 async def webhook_handler(request: web.Request):
     try:
-        # Логируем входящий запрос
-        logger.info(f"Incoming request from {request.remote}")
+        # Проверка метода и Content-Type
+        if request.method != 'POST':
+            return web.Response(status=405, text="Method Not Allowed")
         
-        # Проверяем Content-Type
         if request.content_type != 'application/json':
-            logger.error(f"Invalid content type: {request.content_type}")
             return web.Response(status=415, text="Unsupported Media Type")
 
-        # Читаем тело запроса
+        # Чтение и валидация данных
         try:
             data = await request.json()
-            logger.debug(f"Received update: {json.dumps(data, indent=2)}")
-        except json.JSONDecodeError as e:
+            logger.debug(f"Raw update: {json.dumps(data, indent=2)}")
+        except Exception as e:
             logger.error(f"JSON decode error: {str(e)}")
             return web.Response(status=400, text="Invalid JSON")
-        except Exception as e:
-            logger.error(f"Request read error: {str(e)}")
-            return web.Response(status=400, text="Bad Request")
 
-        # Валидация структуры Update
-        if not isinstance(data, dict) or 'update_id' not in data:
-            logger.error(f"Invalid update structure: {data}")
+        # Создание объекта Update с проверкой
+        try:
+            update = Update(**data)
+            
+            # Валидация содержимого Update
+            if update.message and not validate_message(update.message):
+                return web.Response(status=400, text="Invalid message")
+                
+            if update.callback_query and not update.callback_query.data:
+                return web.Response(status=400, text="Invalid callback")
+                
+        except Exception as e:
+            logger.error(f"Update validation error: {str(e)}")
             return web.Response(status=400, text="Invalid update format")
 
-        # Создаем объект Update
-        try:
-            update = types.Update(**data)
-            logger.info(f"Processing update ID: {update.update_id}")
-        except Exception as e:
-            logger.error(f"Update creation error: {str(e)}")
-            return web.Response(status=400, text="Invalid update data")
-
-        # Обрабатываем update
+        # Обработка update
         try:
             await dp.feed_update(bot, update)
             return web.Response(text="OK")
@@ -256,22 +285,26 @@ async def webhook_handler(request: web.Request):
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         return web.Response(status=500, text="Server Error")
 
-# Middleware для логирования обработки апдейтов
+# --- Middleware для дополнительной валидации ---
 @dp.update.middleware()
-async def log_updates(handler, event: types.Update, data):
-    logger.info(f"Processing update ID: {event.update_id}")
-    try:
-        return await handler(event, data)
-    except Exception as e:
-        logger.error(f"Handler error: {str(e)}", exc_info=True)
-        raise
+async def validation_middleware(handler, event: Update, data):
+    if event.message and not validate_message(event.message):
+        logger.warning(f"Invalid message in update: {event}")
+        return
+    
+    if event.callback_query and not event.callback_query.data:
+        logger.warning(f"Invalid callback in update: {event}")
+        return
+        
+    return await handler(event, data)
 
 # --- Запуск приложения ---
 async def on_startup(app: web.Application):
     try:
         await bot.set_webhook(
             url=f"{BASE_URL}/webhook",
-            drop_pending_updates=True
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"]
         )
         logger.info(f"Webhook установлен на {BASE_URL}/webhook")
     except Exception as e:
