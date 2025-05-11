@@ -8,14 +8,7 @@ from mimetypes import guess_extension
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    Update,
-    User,
-    Chat
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, Update
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiohttp import web
 from dotenv import load_dotenv
@@ -44,25 +37,19 @@ dp = Dispatcher()
 user_context: Dict[int, List[dict]] = {}
 user_edit_state: Dict[int, dict] = {}
 
-# --- Валидация входящих сообщений ---
+# --- Вспомогательные функции ---
+def safe_get_text(message: Optional[types.Message]) -> Optional[str]:
+    """Безопасное получение текста сообщения"""
+    return message.text if message and hasattr(message, 'text') else None
+
 def validate_message(message: Optional[types.Message]) -> bool:
-    if message is None:
+    """Проверка валидности сообщения"""
+    if not message:
         logger.warning("Received None message")
         return False
-    
-    if message.text is None and not any([
-        message.photo,
-        message.document,
-        message.sticker,
-        message.animation
-    ]):
-        logger.warning(f"Message without content: {message}")
-        return False
-    
-    if message.from_user is None:
+    if not message.from_user:
         logger.warning("Message without sender")
         return False
-    
     return True
 
 # --- Клавиатуры ---
@@ -78,6 +65,9 @@ def get_main_kb() -> ReplyKeyboardMarkup:
 # --- Команды ---
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
+    if not validate_message(message):
+        return
+    
     await message.answer(
         "✨ <b>AI Бот с функциями:</b>\n"
         "- Умный чат, отвечу на ваши вопросы, сгенерирую текст, проанализирую документ\n"
@@ -97,16 +87,30 @@ async def reset_context(message: Message):
 
 @dp.message(F.text == "🖼 Сгенерировать изображение")
 async def ask_gen_prompt(message: Message):
+    if not validate_message(message):
+        return
+    
     await message.answer("Введите запрос для генерации:")
 
 @dp.message(F.text == "✏️ Редактировать изображение")
 async def ask_edit_photo(message: Message):
+    if not validate_message(message):
+        return
+    
     user_edit_state[message.from_user.id] = {}
     await message.answer("Загрузите изображение:")
 
 # --- Генерация изображений ---
-@dp.message(F.text & F.reply_to_message.func(lambda msg: msg.text == "Введите запрос для генерации:"))
+@dp.message(
+    F.text,
+    F.reply_to_message.func(
+        lambda msg: safe_get_text(msg) == "Введите запрос для генерации:"
+    )
+)
 async def generate_image(message: Message):
+    if not validate_message(message):
+        return
+    
     prompt = message.text.strip()
     
     try:
@@ -127,12 +131,15 @@ async def generate_image(message: Message):
             await message.answer(f"❌ Ошибка генерации: {error}")
             
     except Exception as e:
-        logger.error(f"Generation error: {str(e)}")
+        logger.error(f"Generation error: {str(e)}", exc_info=True)
         await message.answer(f"⚠️ Ошибка: {str(e)}")
 
 # --- Загрузка изображений ---
 @dp.message(F.content_type.in_({ContentType.PHOTO, ContentType.DOCUMENT}))
 async def handle_image_upload(message: Message):
+    if not validate_message(message):
+        return
+    
     user_id = message.from_user.id
     
     if user_id not in user_edit_state:
@@ -158,13 +165,16 @@ async def handle_image_upload(message: Message):
         await message.answer("Теперь опишите изменения (например: 'Убери фон'):")
         
     except Exception as e:
-        logger.error(f"Upload error: {str(e)}")
+        logger.error(f"Upload error: {str(e)}", exc_info=True)
         await message.answer(f"⚠️ Ошибка загрузки: {str(e)}")
         user_edit_state.pop(user_id, None)
 
 # --- Редактирование изображений ---
-@dp.message(F.text & F.from_user.id.in_(user_edit_state.keys()))
+@dp.message(F.text, F.from_user.id.in_(user_edit_state.keys()))
 async def process_image_edit(message: Message):
+    if not validate_message(message):
+        return
+    
     user_id = message.from_user.id
     edit_prompt = message.text
     image_path = user_edit_state[user_id].get("image_path")
@@ -199,7 +209,7 @@ async def process_image_edit(message: Message):
             await message.answer(f"❌ Ошибка редактирования: {error}")
             
     except Exception as e:
-        logger.error(f"Edit error: {str(e)}")
+        logger.error(f"Edit error: {str(e)}", exc_info=True)
         await message.answer(f"⚠️ Ошибка API: {str(e)}")
     finally:
         if image_path and os.path.exists(image_path):
@@ -207,12 +217,17 @@ async def process_image_edit(message: Message):
         user_edit_state.pop(user_id, None)
 
 # --- Текстовый чат ---
-@dp.message(F.text & ~F.text.in_([
-    "🖼 Сгенерировать изображение", 
-    "✏️ Редактировать изображение",
-    "🔄 Сбросить контекст"
-]))
+@dp.message(F.text)
 async def handle_ai_chat(message: Message):
+    if not validate_message(message):
+        return
+    
+    # Пропускаем служебные команды
+    if message.text in ["🖼 Сгенерировать изображение", 
+                       "✏️ Редактировать изображение",
+                       "🔄 Сбросить контекст"]:
+        return
+    
     user_id = message.from_user.id
     
     if user_id not in user_context:
@@ -237,7 +252,7 @@ async def handle_ai_chat(message: Message):
         await message.answer(answer, reply_markup=get_main_kb())
         
     except Exception as e:
-        logger.error(f"Chat error: {str(e)}")
+        logger.error(f"Chat error: {str(e)}", exc_info=True)
         await message.answer(f"⚠️ Ошибка: {str(e)}")
 
 # --- Обработчик вебхука ---
@@ -253,25 +268,19 @@ async def webhook_handler(request: web.Request):
         # Чтение и валидация данных
         try:
             data = await request.json()
-            logger.debug(f"Raw update: {json.dumps(data, indent=2)}")
+            logger.debug(f"Received update: {json.dumps(data, indent=2)}")
         except Exception as e:
             logger.error(f"JSON decode error: {str(e)}")
             return web.Response(status=400, text="Invalid JSON")
 
-        # Создание объекта Update с проверкой
+        # Создание объекта Update
         try:
             update = Update(**data)
-            
-            # Валидация содержимого Update
-            if update.message and not validate_message(update.message):
+            if not validate_message(update.message):
                 return web.Response(status=400, text="Invalid message")
-                
-            if update.callback_query and not update.callback_query.data:
-                return web.Response(status=400, text="Invalid callback")
-                
         except Exception as e:
-            logger.error(f"Update validation error: {str(e)}")
-            return web.Response(status=400, text="Invalid update format")
+            logger.error(f"Update creation error: {str(e)}")
+            return web.Response(status=400, text="Invalid update data")
 
         # Обработка update
         try:
@@ -284,19 +293,6 @@ async def webhook_handler(request: web.Request):
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         return web.Response(status=500, text="Server Error")
-
-# --- Middleware для дополнительной валидации ---
-@dp.update.middleware()
-async def validation_middleware(handler, event: Update, data):
-    if event.message and not validate_message(event.message):
-        logger.warning(f"Invalid message in update: {event}")
-        return
-    
-    if event.callback_query and not event.callback_query.data:
-        logger.warning(f"Invalid callback in update: {event}")
-        return
-        
-    return await handler(event, data)
 
 # --- Запуск приложения ---
 async def on_startup(app: web.Application):
