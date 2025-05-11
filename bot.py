@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import tempfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from mimetypes import guess_extension
 
 from aiogram import Bot, Dispatcher, F, types
@@ -38,9 +38,32 @@ user_context: Dict[int, List[dict]] = {}
 user_edit_state: Dict[int, dict] = {}
 
 # --- Вспомогательные функции ---
-def safe_get_text(message: Optional[types.Message]) -> Optional[str]:
-    """Безопасное получение текста сообщения"""
-    return message.text if message and hasattr(message, 'text') else None
+async def make_api_request(url: str, method: str = "POST", **kwargs) -> Tuple[bool, dict]:
+    """Универсальная функция для API-запросов с обработкой ошибок"""
+    try:
+        response = await requests.request(
+            method,
+            url,
+            **kwargs,
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            error_msg = f"API error: {response.status_code} - {response.text}"
+            logger.error(error_msg)
+            return False, {"error": error_msg}
+        
+        try:
+            return True, response.json()
+        except ValueError as e:
+            error_msg = f"JSON decode error: {str(e)}"
+            logger.error(error_msg)
+            return False, {"error": error_msg}
+            
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Request failed: {str(e)}"
+        logger.error(error_msg)
+        return False, {"error": error_msg}
 
 def validate_message(message: Optional[types.Message]) -> bool:
     """Проверка валидности сообщения"""
@@ -104,7 +127,7 @@ async def ask_edit_photo(message: Message):
 @dp.message(
     F.text,
     F.reply_to_message.func(
-        lambda msg: safe_get_text(msg) == "Введите запрос для генерации:"
+        lambda msg: msg and hasattr(msg, 'text') and msg.text == "Введите запрос для генерации:"
     )
 )
 async def generate_image(message: Message):
@@ -116,19 +139,18 @@ async def generate_image(message: Message):
     try:
         await message.answer_chat_action("upload_photo")
         
-        resp = requests.post(
+        success, result = await make_api_request(
             "https://api.stability.ai/v2beta/stable-image/generate/sd3",
+            method="POST",
             headers={"Authorization": f"Bearer {STABILITY_API_KEY}"},
             files={"none": ""},
-            data={"prompt": prompt, "output_format": "png"},
-            timeout=60
+            data={"prompt": prompt, "output_format": "png"}
         )
         
-        if resp.status_code == 200:
-            await message.answer_photo(resp.content, caption=f"🎨 {prompt}")
+        if success:
+            await message.answer_photo(result.content, caption=f"🎨 {prompt}")
         else:
-            error = resp.json().get("message", "Unknown error")
-            await message.answer(f"❌ Ошибка генерации: {error}")
+            await message.answer(f"❌ Ошибка генерации: {result.get('error', 'Unknown error')}")
             
     except Exception as e:
         logger.error(f"Generation error: {str(e)}", exc_info=True)
@@ -236,21 +258,24 @@ async def handle_ai_chat(message: Message):
     user_context[user_id].append({"role": "user", "content": message.text})
     
     try:
-        response = requests.post(
+        success, response = await make_api_request(
             "https://api.deepseek.com/v1/chat/completions",
+            method="POST",
             headers={"Content-Type": "application/json"},
             json={
                 "model": "deepseek-chat",
                 "messages": user_context[user_id],
                 "temperature": 0.7
-            },
-            timeout=30
-        ).json()
+            }
+        )
         
-        answer = response["choices"][0]["message"]["content"]
-        user_context[user_id].append({"role": "assistant", "content": answer})
-        await message.answer(answer, reply_markup=get_main_kb())
-        
+        if success:
+            answer = response["choices"][0]["message"]["content"]
+            user_context[user_id].append({"role": "assistant", "content": answer})
+            await message.answer(answer, reply_markup=get_main_kb())
+        else:
+            await message.answer(f"⚠️ Ошибка API: {response.get('error', 'Unknown error')}")
+            
     except Exception as e:
         logger.error(f"Chat error: {str(e)}", exc_info=True)
         await message.answer(f"⚠️ Ошибка: {str(e)}")
@@ -258,41 +283,32 @@ async def handle_ai_chat(message: Message):
 # --- Обработчик вебхука ---
 async def webhook_handler(request: web.Request):
     try:
-        # Проверка метода и Content-Type
         if request.method != 'POST':
-            return web.Response(status=405, text="Method Not Allowed")
+            return web.Response(status=405)
         
         if request.content_type != 'application/json':
-            return web.Response(status=415, text="Unsupported Media Type")
-
-        # Чтение и валидация данных
+            return web.Response(status=415)
+        
         try:
             data = await request.json()
-            logger.debug(f"Received update: {json.dumps(data, indent=2)}")
-        except Exception as e:
-            logger.error(f"JSON decode error: {str(e)}")
-            return web.Response(status=400, text="Invalid JSON")
-
-        # Создание объекта Update
+        except json.JSONDecodeError:
+            return web.Response(status=400)
+        
         try:
             update = Update(**data)
             if not validate_message(update.message):
-                return web.Response(status=400, text="Invalid message")
-        except Exception as e:
-            logger.error(f"Update creation error: {str(e)}")
-            return web.Response(status=400, text="Invalid update data")
-
-        # Обработка update
+                return web.Response(status=400)
+        except Exception:
+            return web.Response(status=400)
+        
         try:
             await dp.feed_update(bot, update)
-            return web.Response(text="OK")
-        except Exception as e:
-            logger.error(f"Update processing error: {str(e)}", exc_info=True)
-            return web.Response(status=500, text="Internal Server Error")
+            return web.Response()
+        except Exception:
+            return web.Response(status=500)
 
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        return web.Response(status=500, text="Server Error")
+    except Exception:
+        return web.Response(status=500)
 
 # --- Запуск приложения ---
 async def on_startup(app: web.Application):
@@ -300,11 +316,11 @@ async def on_startup(app: web.Application):
         await bot.set_webhook(
             url=f"{BASE_URL}/webhook",
             drop_pending_updates=True,
-            allowed_updates=["message", "callback_query"]
+            allowed_updates=["message"]
         )
-        logger.info(f"Webhook установлен на {BASE_URL}/webhook")
+        logger.info("Webhook установлен")
     except Exception as e:
-        logger.error(f"Webhook setup error: {str(e)}")
+        logger.error(f"Webhook error: {str(e)}")
         raise
 
 if __name__ == "__main__":
