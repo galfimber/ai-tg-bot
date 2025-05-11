@@ -38,10 +38,9 @@ bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # Хранение данных
-user_context: Dict[int, Dict] = {}  # {"awaiting_image_prompt": bool, "chat_history": list}
+user_context: Dict[int, Dict] = {}
 http_session: Optional[ClientSession] = None
 
-# ========== Клавиатура ==========
 def get_main_kb() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.row(
@@ -50,9 +49,7 @@ def get_main_kb() -> ReplyKeyboardMarkup:
     )
     return builder.as_markup(resize_keyboard=True)
 
-# ========== API Functions ==========
 async def generate_image(prompt: str) -> Optional[bytes]:
-    """Генерация изображения через Stable Diffusion XL"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -90,7 +87,6 @@ async def generate_image(prompt: str) -> Optional[bytes]:
         return None
 
 async def ask_gemini(prompt: str, user_id: int) -> str:
-    """Запрос к Gemini через OpenRouter"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -98,18 +94,16 @@ async def ask_gemini(prompt: str, user_id: int) -> str:
         "X-Title": SITE_NAME
     }
     
-    # Инициализация контекста чата
     if user_id not in user_context:
         user_context[user_id] = {"chat_history": []}
     elif "chat_history" not in user_context[user_id]:
         user_context[user_id]["chat_history"] = []
     
-    # Добавляем новый запрос в историю
     user_context[user_id]["chat_history"].append({"role": "user", "content": prompt})
     
     payload = {
         "model": "google/gemini-2.0-flash-exp:free",
-        "messages": user_context[user_id]["chat_history"][-6:],  # Последние 6 сообщений
+        "messages": user_context[user_id]["chat_history"][-6:],
         "temperature": 0.7
     }
     
@@ -131,7 +125,6 @@ async def ask_gemini(prompt: str, user_id: int) -> str:
         logger.error(f"Ошибка запроса к Gemini: {str(e)}")
         return "⚠️ Произошла ошибка при обработке запроса"
 
-# ========== Message Handlers ==========
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -160,14 +153,12 @@ async def handle_text(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
     
-    # Проверка на команду отмены
     if text.lower() == "отмена":
         if user_id in user_context:
             user_context.pop(user_id)
         await message.answer("Операция отменена", reply_markup=get_main_kb())
         return
     
-    # Обработка запроса на генерацию изображения
     if user_id in user_context and user_context[user_id].get("awaiting_image_prompt"):
         user_context[user_id].pop("awaiting_image_prompt")
         
@@ -178,13 +169,14 @@ async def handle_text(message: Message):
         await process_image_generation(message, text)
         return
     
-    # Обычный текстовый запрос
     if text not in ["🖼 Сгенерировать изображение", "🔄 Сбросить контекст"]:
         reply = await ask_gemini(text, user_id)
         await message.answer(reply, reply_markup=get_main_kb())
 
 async def process_image_generation(message: Message, prompt: str):
-    await message.answer_chat_action("upload_photo")
+    # Исправленный вызов chat action
+    await bot.send_chat_action(message.chat.id, "upload_photo")
+    
     image_data = await generate_image(prompt)
     
     if image_data:
@@ -195,7 +187,6 @@ async def process_image_generation(message: Message, prompt: str):
     else:
         await message.answer("❌ Не удалось сгенерировать изображение. Попробуйте другой запрос.")
 
-# ========== Webhook Setup ==========
 async def on_startup(app: web.Application):
     global http_session
     http_session = ClientSession()
