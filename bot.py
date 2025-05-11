@@ -12,9 +12,9 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    Update,
-    DefaultBotProperties
+    Update
 )
+from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiohttp import web, ClientSession, FormData
 from dotenv import load_dotenv
