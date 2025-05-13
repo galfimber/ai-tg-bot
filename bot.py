@@ -1,12 +1,18 @@
 import os
 import json
 import logging
+import asyncio
 from typing import Dict, Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BufferedInputFile
+)
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -41,6 +47,7 @@ dp = Dispatcher()
 user_context: Dict[int, Dict] = {}
 http_session: Optional[ClientSession] = None
 
+# ========== Клавиатура ==========
 def get_main_kb() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.row(
@@ -49,7 +56,9 @@ def get_main_kb() -> ReplyKeyboardMarkup:
     )
     return builder.as_markup(resize_keyboard=True)
 
+# ========== API Functions ==========
 async def generate_image(prompt: str) -> Optional[bytes]:
+    """Генерация изображения через Stable Diffusion XL"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -74,19 +83,26 @@ async def generate_image(prompt: str) -> Optional[bytes]:
             headers=headers,
             json=payload
         ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                logger.error(f"Ошибка генерации: {response.status} - {error_text}")
+                return None
+                
             data = await response.json()
             
-            if response.status == 200:
+            if "data" in data and data["data"]:
                 image_url = data["data"][0]["url"]
                 async with http_session.get(image_url) as img_response:
-                    return await img_response.read()
-            logger.error(f"Ошибка генерации: {data}")
+                    if img_response.status == 200:
+                        return await img_response.read()
+                    logger.error(f"Ошибка загрузки изображения: {img_response.status}")
             return None
     except Exception as e:
         logger.error(f"Ошибка при генерации изображения: {str(e)}")
         return None
 
 async def ask_gemini(prompt: str, user_id: int) -> str:
+    """Запрос к Gemini через OpenRouter"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -94,16 +110,16 @@ async def ask_gemini(prompt: str, user_id: int) -> str:
         "X-Title": SITE_NAME
     }
     
+    # Инициализация контекста
     if user_id not in user_context:
         user_context[user_id] = {"chat_history": []}
-    elif "chat_history" not in user_context[user_id]:
-        user_context[user_id]["chat_history"] = []
     
+    # Добавляем новый запрос в историю
     user_context[user_id]["chat_history"].append({"role": "user", "content": prompt})
     
     payload = {
-        "model": "google/gemini-2.0-flash-exp:free",
-        "messages": user_context[user_id]["chat_history"][-6:],
+        "model": "google/gemini-pro",
+        "messages": user_context[user_id]["chat_history"][-6:],  # Последние 6 сообщений
         "temperature": 0.7
     }
     
@@ -113,24 +129,37 @@ async def ask_gemini(prompt: str, user_id: int) -> str:
             headers=headers,
             json=payload
         ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                logger.error(f"Ошибка API: {response.status} - {error_text}")
+                return f"❌ Ошибка API (код {response.status})"
+            
             data = await response.json()
             
-            if response.status == 200:
+            # Обработка разных форматов ответа
+            if "choices" in data and data["choices"]:
                 reply = data["choices"][0]["message"]["content"]
-                user_context[user_id]["chat_history"].append({"role": "assistant", "content": reply})
-                return reply
-            error_msg = data.get("error", {}).get("message", "Неизвестная ошибка API")
-            return f"❌ Ошибка: {error_msg}"
+            elif "message" in data:
+                reply = data["message"]["content"]
+            else:
+                logger.error(f"Неожиданный формат ответа: {data}")
+                return "⚠️ Получен неожиданный формат ответа"
+            
+            # Сохраняем ответ в историю
+            user_context[user_id]["chat_history"].append({"role": "assistant", "content": reply})
+            return reply
+            
     except Exception as e:
         logger.error(f"Ошибка запроса к Gemini: {str(e)}")
-        return "⚠️ Произошла ошибка при обработке запроса"
+        return f"⚠️ Ошибка при обработке запроса: {str(e)}"
 
+# ========== Message Handlers ==========
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     await message.answer(
         "✨ <b>AI Бот с функциями:</b>\n"
         "- Генерация изображений через Stable Diffusion\n"
-        "- Умный чат на основе Gemini Flash\n\n"
+        "- Умный чат на основе Gemini\n\n"
         "Используйте кнопки ниже:",
         reply_markup=get_main_kb()
     )
@@ -153,12 +182,13 @@ async def handle_text(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
     
+    # Обработка команды отмены
     if text.lower() == "отмена":
-        if user_id in user_context:
-            user_context.pop(user_id)
+        user_context.pop(user_id, None)
         await message.answer("Операция отменена", reply_markup=get_main_kb())
         return
     
+    # Обработка запроса на генерацию изображения
     if user_id in user_context and user_context[user_id].get("awaiting_image_prompt"):
         user_context[user_id].pop("awaiting_image_prompt")
         
@@ -169,14 +199,13 @@ async def handle_text(message: Message):
         await process_image_generation(message, text)
         return
     
+    # Обычный текстовый запрос
     if text not in ["🖼 Сгенерировать изображение", "🔄 Сбросить контекст"]:
         reply = await ask_gemini(text, user_id)
         await message.answer(reply, reply_markup=get_main_kb())
 
 async def process_image_generation(message: Message, prompt: str):
-    # Исправленный вызов chat action
     await bot.send_chat_action(message.chat.id, "upload_photo")
-    
     image_data = await generate_image(prompt)
     
     if image_data:
@@ -187,6 +216,21 @@ async def process_image_generation(message: Message, prompt: str):
     else:
         await message.answer("❌ Не удалось сгенерировать изображение. Попробуйте другой запрос.")
 
+# ========== Keep Alive ==========
+async def keep_alive():
+    """Периодические запросы для поддержания активности"""
+    while True:
+        try:
+            async with http_session.get(f"{BASE_URL}/healthz") as resp:
+                logger.info(f"Keep-alive: {resp.status}")
+        except Exception as e:
+            logger.error(f"Keep-alive failed: {str(e)}")
+        await asyncio.sleep(300)  # Каждые 5 минут
+
+# ========== Webhook Setup ==========
+async def health_check(request):
+    return web.Response(text="OK")
+
 async def on_startup(app: web.Application):
     global http_session
     http_session = ClientSession()
@@ -195,19 +239,19 @@ async def on_startup(app: web.Application):
         url=f"{BASE_URL}/webhook",
         drop_pending_updates=True
     )
-    logger.info("Webhook установлен")
+    asyncio.create_task(keep_alive())
+    logger.info("Bot started with keep-alive")
 
 async def on_shutdown(app: web.Application):
     global http_session
     if http_session:
         await http_session.close()
     await bot.delete_webhook()
-    logger.info("Webhook удален")
+    logger.info("Bot stopped")
 
 if __name__ == "__main__":
     app = web.Application()
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
+    app.router.add_get("/healthz", health_check)
     
     webhook_handler = SimpleRequestHandler(
         dispatcher=dp,
@@ -215,6 +259,9 @@ if __name__ == "__main__":
     )
     webhook_handler.register(app, path="/webhook")
     setup_application(app, dp, bot=bot)
+    
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     
     try:
         web.run_app(
