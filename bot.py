@@ -111,7 +111,7 @@ async def ask_llama(prompt: str, user_id: int) -> str:
     user_context[user_id]["chat_history"].append({"role": "user", "content": prompt})
     
     payload = {
-        "model": "meta/llama-4-maverick:free",  # Используем Llama 4 Mavericks
+        "model": "meta-llama/llama-4-maverick:free",  # Используем Llama 4 Mavericks
         "messages": user_context[user_id]["chat_history"][-6:],  # Последние 6 сообщений
         "temperature": 0.7
     }
