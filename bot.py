@@ -7,12 +7,7 @@ from typing import Dict, Optional
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    BufferedInputFile
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -47,7 +42,6 @@ dp = Dispatcher()
 user_context: Dict[int, Dict] = {}
 http_session: Optional[ClientSession] = None
 
-# ========== Клавиатура ==========
 def get_main_kb() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.row(
@@ -56,7 +50,6 @@ def get_main_kb() -> ReplyKeyboardMarkup:
     )
     return builder.as_markup(resize_keyboard=True)
 
-# ========== API Functions ==========
 async def generate_image(prompt: str) -> Optional[bytes]:
     """Генерация изображения через Stable Diffusion XL"""
     headers = {
@@ -101,8 +94,8 @@ async def generate_image(prompt: str) -> Optional[bytes]:
         logger.error(f"Ошибка при генерации изображения: {str(e)}")
         return None
 
-async def ask_gemini(prompt: str, user_id: int) -> str:
-    """Запрос к Gemini через OpenRouter"""
+async def ask_llama(prompt: str, user_id: int) -> str:
+    """Запрос к Llama 4 Mavericks через OpenRouter"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -118,7 +111,7 @@ async def ask_gemini(prompt: str, user_id: int) -> str:
     user_context[user_id]["chat_history"].append({"role": "user", "content": prompt})
     
     payload = {
-        "model": "google/gemini-pro",
+        "model": "meta/llama-4-maverick:free",  # Используем Llama 4 Mavericks
         "messages": user_context[user_id]["chat_history"][-6:],  # Последние 6 сообщений
         "temperature": 0.7
     }
@@ -136,30 +129,25 @@ async def ask_gemini(prompt: str, user_id: int) -> str:
             
             data = await response.json()
             
-            # Обработка разных форматов ответа
+            # Обработка ответа
             if "choices" in data and data["choices"]:
                 reply = data["choices"][0]["message"]["content"]
-            elif "message" in data:
-                reply = data["message"]["content"]
-            else:
-                logger.error(f"Неожиданный формат ответа: {data}")
-                return "⚠️ Получен неожиданный формат ответа"
+                user_context[user_id]["chat_history"].append({"role": "assistant", "content": reply})
+                return reply
             
-            # Сохраняем ответ в историю
-            user_context[user_id]["chat_history"].append({"role": "assistant", "content": reply})
-            return reply
+            logger.error(f"Неожиданный формат ответа: {data}")
+            return "⚠️ Получен неожиданный формат ответа"
             
     except Exception as e:
-        logger.error(f"Ошибка запроса к Gemini: {str(e)}")
+        logger.error(f"Ошибка запроса: {str(e)}")
         return f"⚠️ Ошибка при обработке запроса: {str(e)}"
 
-# ========== Message Handlers ==========
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     await message.answer(
         "✨ <b>AI Бот с функциями:</b>\n"
         "- Генерация изображений через Stable Diffusion\n"
-        "- Умный чат на основе Gemini\n\n"
+        "- Умный чат на основе Llama 4 Mavericks\n\n"
         "Используйте кнопки ниже:",
         reply_markup=get_main_kb()
     )
@@ -182,13 +170,11 @@ async def handle_text(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
     
-    # Обработка команды отмены
     if text.lower() == "отмена":
         user_context.pop(user_id, None)
         await message.answer("Операция отменена", reply_markup=get_main_kb())
         return
     
-    # Обработка запроса на генерацию изображения
     if user_id in user_context and user_context[user_id].get("awaiting_image_prompt"):
         user_context[user_id].pop("awaiting_image_prompt")
         
@@ -199,9 +185,8 @@ async def handle_text(message: Message):
         await process_image_generation(message, text)
         return
     
-    # Обычный текстовый запрос
     if text not in ["🖼 Сгенерировать изображение", "🔄 Сбросить контекст"]:
-        reply = await ask_gemini(text, user_id)
+        reply = await ask_llama(text, user_id)
         await message.answer(reply, reply_markup=get_main_kb())
 
 async def process_image_generation(message: Message, prompt: str):
@@ -216,7 +201,6 @@ async def process_image_generation(message: Message, prompt: str):
     else:
         await message.answer("❌ Не удалось сгенерировать изображение. Попробуйте другой запрос.")
 
-# ========== Keep Alive ==========
 async def keep_alive():
     """Периодические запросы для поддержания активности"""
     while True:
@@ -227,7 +211,6 @@ async def keep_alive():
             logger.error(f"Keep-alive failed: {str(e)}")
         await asyncio.sleep(300)  # Каждые 5 минут
 
-# ========== Webhook Setup ==========
 async def health_check(request):
     return web.Response(text="OK")
 
